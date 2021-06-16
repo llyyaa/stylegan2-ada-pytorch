@@ -94,14 +94,24 @@ class FullyConnectedLayer(torch.nn.Module):
         activation      = 'linear', # Activation function: 'relu', 'lrelu', etc.
         lr_multiplier   = 1,        # Learning rate multiplier.
         bias_init       = 0,        # Initial value for the additive bias.
+        trainable       = True,
     ):
         super().__init__()
         self.activation = activation
-        self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) / lr_multiplier)
-        self.bias = torch.nn.Parameter(torch.full([out_features], np.float32(bias_init))) if bias else None
+        weight = torch.randn([out_features, in_features]) / lr_multiplier
+        if bias: _bias = torch.full([out_features], np.float32(bias_init))
+        if (trainable) :
+            self.weight = torch.nn.Parameter(weight)
+            self.bias = torch.nn.Parameter(_bias) if bias else None
+            
+            
+
+        else:
+            self.register_buffer('weight', weight)
+            if(bias) : self.register_buffer('bias', _bias)
         self.weight_gain = lr_multiplier / np.sqrt(in_features)
         self.bias_gain = lr_multiplier
-
+            
     def forward(self, x):
         w = self.weight.to(x.dtype) * self.weight_gain
         b = self.bias
@@ -183,6 +193,7 @@ class MappingNetwork(torch.nn.Module):
         activation      = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
         lr_multiplier   = 0.01,     # Learning rate multiplier for the mapping layers.
         w_avg_beta      = 0.995,    # Decay for tracking the moving average of W during training, None = do not track.
+        trainable       = True,
     ):
         super().__init__()
         self.z_dim = z_dim
@@ -191,6 +202,7 @@ class MappingNetwork(torch.nn.Module):
         self.num_ws = num_ws
         self.num_layers = num_layers
         self.w_avg_beta = w_avg_beta
+        self.trainable = trainable
 
         if embed_features is None:
             embed_features = w_dim
@@ -201,11 +213,11 @@ class MappingNetwork(torch.nn.Module):
         features_list = [z_dim + embed_features] + [layer_features] * (num_layers - 1) + [w_dim]
 
         if c_dim > 0:
-            self.embed = FullyConnectedLayer(c_dim, embed_features)
+            self.embed = FullyConnectedLayer(c_dim, embed_features, trainable = trainable)
         for idx in range(num_layers):
             in_features = features_list[idx]
             out_features = features_list[idx + 1]
-            layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
+            layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier, trainable = trainable)
             setattr(self, f'fc{idx}', layer)
 
         if num_ws is not None and w_avg_beta is not None:
@@ -214,7 +226,16 @@ class MappingNetwork(torch.nn.Module):
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
         # Embed, normalize, and concat inputs.
         x = None
-        with torch.autograd.profiler.record_function('input'):
+        if(self.trainable):
+            with torch.autograd.profiler.record_function('input'):
+                if self.z_dim > 0:
+                    misc.assert_shape(z, [None, self.z_dim])
+                    x = normalize_2nd_moment(z.to(torch.float32))
+                if self.c_dim > 0:
+                    misc.assert_shape(c, [None, self.c_dim])
+                    y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
+                    x = torch.cat([x, y], dim=1) if x is not None else y
+        else:
             if self.z_dim > 0:
                 misc.assert_shape(z, [None, self.z_dim])
                 x = normalize_2nd_moment(z.to(torch.float32))
@@ -222,6 +243,7 @@ class MappingNetwork(torch.nn.Module):
                 misc.assert_shape(c, [None, self.c_dim])
                 y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
                 x = torch.cat([x, y], dim=1) if x is not None else y
+        
 
         # Main layers.
         for idx in range(self.num_layers):
@@ -230,17 +252,29 @@ class MappingNetwork(torch.nn.Module):
 
         # Update moving average of W.
         if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
-            with torch.autograd.profiler.record_function('update_w_avg'):
+            if(self.trainable):
+                with torch.autograd.profiler.record_function('update_w_avg'):
+                    self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+            else:
                 self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
 
         # Broadcast.
         if self.num_ws is not None:
-            with torch.autograd.profiler.record_function('broadcast'):
-                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+            if(self.trainable):
+                with torch.autograd.profiler.record_function('broadcast'):
+                    x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+            else: x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
 
         # Apply truncation.
         if truncation_psi != 1:
-            with torch.autograd.profiler.record_function('truncate'):
+            if(self.trainable):
+                with torch.autograd.profiler.record_function('truncate'):
+                    assert self.w_avg_beta is not None
+                    if self.num_ws is None or truncation_cutoff is None:
+                        x = self.w_avg.lerp(x, truncation_psi)
+                    else:
+                        x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+            else:
                 assert self.w_avg_beta is not None
                 if self.num_ws is None or truncation_cutoff is None:
                     x = self.w_avg.lerp(x, truncation_psi)
@@ -275,7 +309,8 @@ class SynthesisLayer(torch.nn.Module):
         self.padding = kernel_size // 2
         self.act_gain = bias_act.activation_funcs[activation].def_gain
 
-        self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+        self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1, trainable = True)
+        
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
         self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
         if use_noise:
@@ -492,7 +527,8 @@ class Generator(torch.nn.Module):
         self.img_channels = img_channels
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
-        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs, trainable = True)
+        
 
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
